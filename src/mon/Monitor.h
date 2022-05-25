@@ -217,7 +217,8 @@ public:
   std::vector<DaemonHealthMetric> get_health_metrics();
 
   int quorum_age() const {
-    auto age = ceph::mono_clock::now() - quorum_since;
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+      ceph::mono_clock::now() - quorum_since);
     return age.count();
   }
 
@@ -794,6 +795,8 @@ public:
     const health_check_map_t& updated,
     const health_check_map_t& previous,
     MonitorDBStore::TransactionRef t);
+
+  void update_pending_metadata();
 
 protected:
 

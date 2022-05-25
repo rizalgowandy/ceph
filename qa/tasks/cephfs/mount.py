@@ -14,11 +14,16 @@ from IPy import IP
 from teuthology.contextutil import safe_while
 from teuthology.misc import get_file, write_file
 from teuthology.orchestra import run
-from teuthology.orchestra.run import CommandFailedError, ConnectionLostError, Raw
+from teuthology.orchestra.run import Raw
+from teuthology.exceptions import CommandFailedError, ConnectionLostError
 
 from tasks.cephfs.filesystem import Filesystem
 
 log = logging.getLogger(__name__)
+
+
+UMOUNT_TIMEOUT = 300
+
 
 class CephFSMount(object):
     def __init__(self, ctx, test_dir, client_id, client_remote,
@@ -55,6 +60,8 @@ class CephFSMount(object):
             self.hostfs_mntpt = os.path.join(self.test_dir, f'mnt.{self.client_id}')
         self.cephfs_name = cephfs_name
         self.cephfs_mntpt = cephfs_mntpt
+
+        self.cluster_name = 'ceph' # TODO: use config['cluster']
 
         self.fs = None
 
@@ -124,8 +131,7 @@ class CephFSMount(object):
         self._netns_name = name
 
     def assert_that_ceph_fs_exists(self):
-        output = self.client_remote.run(args='ceph fs ls', stdout=StringIO()).\
-            stdout.getvalue()
+        output = self.ctx.managers[self.cluster_name].raw_cluster_cmd("fs", "ls")
         if self.cephfs_name:
             assert self.cephfs_name in output, \
                 'expected ceph fs is not present on the cluster'
@@ -450,7 +456,8 @@ class CephFSMount(object):
     def umount(self):
         raise NotImplementedError()
 
-    def umount_wait(self, force=False, require_clean=False, timeout=None):
+    def umount_wait(self, force=False, require_clean=False,
+                    timeout=UMOUNT_TIMEOUT):
         """
 
         :param force: Expect that the mount will not shutdown cleanly: kill
@@ -565,6 +572,7 @@ class CephFSMount(object):
         raise NotImplementedError()
 
     def get_keyring_path(self):
+        # N.B.: default keyring is /etc/ceph/ceph.keyring; see ceph.py and generate_caps
         return '/etc/ceph/ceph.client.{id}.keyring'.format(id=self.client_id)
 
     def get_key_from_keyfile(self):
@@ -692,18 +700,22 @@ class CephFSMount(object):
         p.wait()
         return p.stdout.getvalue().strip()
 
-    def run_shell(self, args, timeout=900, **kwargs):
-        args = args.split() if isinstance(args, str) else args
-        kwargs.pop('omit_sudo', False)
+    def run_shell(self, args, timeout=300, **kwargs):
+        omit_sudo = kwargs.pop('omit_sudo', False)
         sudo = kwargs.pop('sudo', False)
         cwd = kwargs.pop('cwd', self.mountpoint)
         stdout = kwargs.pop('stdout', StringIO())
         stderr = kwargs.pop('stderr', StringIO())
 
         if sudo:
-            args.insert(0, 'sudo')
+            if isinstance(args, list):
+                args.insert(0, 'sudo')
+            elif isinstance(args, str):
+                args = 'sudo ' + args
 
-        return self.client_remote.run(args=args, cwd=cwd, timeout=timeout, stdout=stdout, stderr=stderr, **kwargs)
+        return self.client_remote.run(args=args, cwd=cwd, timeout=timeout,
+                                      stdout=stdout, stderr=stderr,
+                                      omit_sudo=omit_sudo, **kwargs)
 
     def run_shell_payload(self, payload, **kwargs):
         return self.run_shell(["bash", "-c", Raw(f"'{payload}'")], **kwargs)
@@ -1152,6 +1164,20 @@ class CephFSMount(object):
 
     def get_op_read_count(self):
         raise NotImplementedError()
+
+    def readlink(self, fs_path):
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
+
+        pyscript = dedent("""
+            import os
+
+            print(os.readlink("{path}"))
+            """).format(path=abs_path)
+
+        proc = self._run_python(pyscript)
+        proc.wait()
+        return str(proc.stdout.getvalue().strip())
+
 
     def lstat(self, fs_path, follow_symlinks=False, wait=True):
         return self.stat(fs_path, follow_symlinks=False, wait=True)

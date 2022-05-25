@@ -7,7 +7,6 @@
  */
 #include "common/version.h"
 #include "include/Context.h"
-
 #include "osd/osd_types.h"
 
 namespace Scrub {
@@ -19,6 +18,10 @@ enum class PreemptionNoted { no_preemption, preempted };
 struct preemption_t {
 
   virtual ~preemption_t() = default;
+
+  preemption_t() = default;
+  preemption_t(const preemption_t&) = delete;
+  preemption_t(preemption_t&&) = delete;
 
   [[nodiscard]] virtual bool is_preemptable() const = 0;
 
@@ -86,13 +89,13 @@ struct ScrubMachineListener {
 
   virtual void replica_handling_done() = 0;
 
-  /// the version of 'scrub_clear_state()' that does not try to invoke FSM services
-  /// (thus can be called from FSM reactions)
+  /// the version of 'scrub_clear_state()' that does not try to invoke FSM
+  /// services (thus can be called from FSM reactions)
   virtual void clear_pgscrub_state() = 0;
 
   /*
-   * Send an 'InternalSchedScrub' FSM event either immediately, or - if 'm_need_sleep'
-   * is asserted - after a configuration-dependent timeout.
+   * Send an 'InternalSchedScrub' FSM event either immediately, or - if
+   * 'm_need_sleep' is asserted - after a configuration-dependent timeout.
    */
   virtual void add_delayed_scheduling() = 0;
 
@@ -103,11 +106,14 @@ struct ScrubMachineListener {
 
   virtual void on_digest_updates() = 0;
 
+  /// the part that actually finalizes a scrub
+  virtual void scrub_finish() = 0;
+
   /**
    * Prepare a MOSDRepScrubMap message carrying the requested scrub map
    * @param was_preempted - were we preempted?
-   * @return the message, and the current value of 'm_replica_min_epoch' (which is
-   *     used when sending the message, but will be overwritten before that).
+   * @return the message, and the current value of 'm_replica_min_epoch' (which
+   * is used when sending the message, but will be overwritten before that).
    */
   [[nodiscard]] virtual MsgAndEpoch prep_replica_map_msg(
     Scrub::PreemptionNoted was_preempted) = 0;
@@ -162,6 +168,12 @@ struct ScrubMachineListener {
   virtual void clear_reserving_now() = 0;
 
   /**
+   * Manipulate the 'I am being scrubbed now' Scrubber's flag
+   */
+  virtual void set_queued_or_active() = 0;
+  virtual void clear_queued_or_active() = 0;
+
+  /**
    * the FSM interface into the "are we waiting for maps, either our own or from
    * replicas" state.
    * The FSM can only:
@@ -174,4 +186,10 @@ struct ScrubMachineListener {
 
   /// a log/debug interface
   virtual std::string dump_awaited_maps() const = 0;
+
+  /// exposed to be used by the scrub_machine logger
+  virtual std::ostream& gen_prefix(std::ostream& out) const = 0;
+
+  /// sending cluster-log warnings
+  virtual void log_cluster_warning(const std::string& msg) const = 0;
 };

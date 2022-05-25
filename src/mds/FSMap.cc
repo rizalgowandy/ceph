@@ -651,6 +651,7 @@ void FSMap::encode(bufferlist& bl, uint64_t features) const
 
 void FSMap::decode(bufferlist::const_iterator& p)
 {
+  struct_version = 0;
   DECODE_START(STRUCT_VERSION, p);
   DECODE_OLDEST(7);
   struct_version = struct_v;
@@ -850,8 +851,12 @@ const MDSMap::mds_info_t* FSMap::find_replacement_for(mds_role_t role) const
   return get_available_standby(*fs);
 }
 
-void FSMap::sanity() const
+void FSMap::sanity(bool pending) const
 {
+  /* Only do some sanity checks on **new** FSMaps. Older versions may not be
+   * compliant.
+   */
+
   if (legacy_client_fscid != FS_CLUSTER_ID_NONE) {
     ceph_assert(filesystems.count(legacy_client_fscid) == 1);
   }
@@ -868,7 +873,7 @@ void FSMap::sanity() const
         ceph_assert(fs->mds_map.failed.count(info.rank) == 0);
         ceph_assert(fs->mds_map.damaged.count(info.rank) == 0);
       } else {
-        ceph_assert(fs->mds_map.allows_standby_replay());
+        ceph_assert(!pending || fs->mds_map.allows_standby_replay());
       }
       ceph_assert(info.compat.writeable(fs->mds_map.compat));
     }
@@ -928,6 +933,11 @@ void FSMap::promote(
   }
   auto& info = mds_map.mds_info.at(standby_gid);
 
+  if (!filesystem.mds_map.compat.writeable(info.compat)) {
+    ceph_assert(filesystem.is_upgradeable());
+    filesystem.mds_map.compat.merge(info.compat);
+  }
+
   if (mds_map.stopped.erase(assigned_rank)) {
     // The cluster is being expanded with a stopped rank
     info.state = MDSMap::STATE_STARTING;
@@ -951,11 +961,6 @@ void FSMap::promote(
   if (!is_standby_replay) {
     standby_daemons.erase(standby_gid);
     standby_epochs.erase(standby_gid);
-  }
-
-  if (!filesystem.mds_map.compat.writeable(info.compat)) {
-    ceph_assert(filesystem.is_upgradeable());
-    filesystem.mds_map.compat.merge(info.compat);
   }
 
   // Indicate that Filesystem has been modified
@@ -1049,10 +1054,22 @@ bool FSMap::undamaged(const fs_cluster_id_t fscid, const mds_rank_t rank)
 
 void FSMap::insert(const MDSMap::mds_info_t &new_info)
 {
+  static const CompatSet empty;
+
   ceph_assert(new_info.state == MDSMap::STATE_STANDBY);
   ceph_assert(new_info.rank == MDS_RANK_NONE);
   mds_roles[new_info.global_id] = FS_CLUSTER_ID_NONE;
-  standby_daemons[new_info.global_id] = new_info;
+  auto& info = standby_daemons[new_info.global_id];
+  info = new_info;
+  if (empty.compare(info.compat) == 0) {
+    // bootstrap old compat: boot beacon contains empty compat on old (v16.2.4
+    // or older) MDS.
+    info.compat = MDSMap::get_compat_set_v16_2_4();
+  }
+  /* TODO remove after R is released
+   * Insert INLINE; see comment in MDSMap::decode.
+   */
+  info.compat.incompat.insert(MDS_FEATURE_INCOMPAT_INLINE);
   standby_epochs[new_info.global_id] = epoch;
 }
 

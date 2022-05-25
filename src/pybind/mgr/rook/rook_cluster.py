@@ -26,6 +26,9 @@ from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, PlacementSpec, HostPlacementSpec
 from ceph.utils import datetime_now
 from ceph.deployment.drive_selection.matchers import SizeMatcher
+from nfs.cluster import create_ganesha_pool
+from nfs.module import Module
+from nfs.export import NFSRados
 from mgr_module import NFS_POOL_NAME
 from mgr_util import merge_dicts
 
@@ -43,12 +46,13 @@ from .rook_client.ceph import cephfilesystem as cfs
 from .rook_client.ceph import cephnfs as cnfs
 from .rook_client.ceph import cephobjectstore as cos
 from .rook_client.ceph import cephcluster as ccl
+from .rook_client.ceph import cephrbdmirror as crbdm
 from .rook_client._helper import CrdClass
 
 import orchestrator
 
 try:
-    from rook.module import RookEnv
+    from rook.module import RookEnv, RookOrchestrator
 except ImportError:
     pass  # just used for type checking.
 
@@ -414,9 +418,13 @@ class DefaultCreator():
             if not hasattr(new_cluster.spec.storage, 'storageClassDeviceSets') or not new_cluster.spec.storage.storageClassDeviceSets:
                 new_cluster.spec.storage.storageClassDeviceSets = ccl.StorageClassDeviceSetsList()
 
+            existing_scds = [
+                scds.name for scds in new_cluster.spec.storage.storageClassDeviceSets
+            ]
             for device in to_create:
                 new_scds = self.device_to_device_set(drive_group, device)
-                new_cluster.spec.storage.storageClassDeviceSets.append(new_scds)
+                if new_scds.name not in existing_scds:
+                    new_cluster.spec.storage.storageClassDeviceSets.append(new_scds)
             return new_cluster
         return _add_osds
 
@@ -635,7 +643,16 @@ class DefaultRemover():
 class RookCluster(object):
     # import of client.CoreV1Api must be optional at import time.
     # Instead allow mgr/rook to be imported anyway.
-    def __init__(self, coreV1_api: 'client.CoreV1Api', batchV1_api: 'client.BatchV1Api', customObjects_api: 'client.CustomObjectsApi', storageV1_api: 'client.StorageV1Api', appsV1_api: 'client.AppsV1Api', rook_env: 'RookEnv', storage_class: 'str'):
+    def __init__(
+        self,
+        coreV1_api: 'client.CoreV1Api',
+        batchV1_api: 'client.BatchV1Api',
+        customObjects_api: 'client.CustomObjectsApi',
+        storageV1_api: 'client.StorageV1Api',
+        appsV1_api: 'client.AppsV1Api',
+        rook_env: 'RookEnv',
+        storage_class: 'str'
+    ):
         self.rook_env = rook_env  # type: RookEnv
         self.coreV1_api = coreV1_api  # client.CoreV1Api
         self.batchV1_api = batchV1_api
@@ -652,8 +669,6 @@ class RookCluster(object):
                                             label_selector="rook_cluster={0}".format(
                                                 self.rook_env.namespace))
         self.nodes: KubernetesResource[client.V1Node] = KubernetesResource(self.coreV1_api.list_node)
-        self.drive_group_map: Dict[str, Any] = {}
-        self.drive_group_lock = threading.Lock()
         
     def rook_url(self, path: str) -> str:
         prefix = "/apis/ceph.rook.io/%s/namespaces/%s/" % (
@@ -703,6 +718,10 @@ class RookCluster(object):
             self.fetcher = DefaultFetcher(self.storage_class, self.coreV1_api)
         self.fetcher.fetch()
         return self.fetcher.devices()
+        
+    def get_osds(self) -> List:
+        osd_pods: KubernetesResource = KubernetesResource(self.coreV1_api.list_namespaced_pod, namespace='rook-ceph', label_selector='app=rook-ceph-osd')
+        return list(osd_pods.items)
         
     def get_nfs_conf_url(self, nfs_cluster: str, instance: str) -> Optional[str]:
         #
@@ -756,7 +775,7 @@ class RookCluster(object):
                             "osd": ("ceph-osd-id", service_id),
                             "mon": ("mon", service_id),
                             "mgr": ("mgr", service_id),
-                            "ceph_nfs": ("ceph_nfs", service_id),
+                            "nfs": ("nfs", service_id),
                             "rgw": ("ceph_rgw", service_id),
                         }[service_type]
                     except KeyError:
@@ -785,7 +804,11 @@ class RookCluster(object):
                 image_name = c['image']
                 break
 
-            image_id = d['status']['container_statuses'][0]['image_id']
+            ls = d['status'].get('container_statuses')
+            if not ls:
+                # ignore pods with no containers
+                continue
+            image_id = ls[0]['image_id']
             image_id = image_id.split(prefix)[1] if prefix in image_id else image_id
 
             s = {
@@ -842,30 +865,65 @@ class RookCluster(object):
             else:
                 raise
 
-    def apply_filesystem(self, spec: ServiceSpec) -> str:
+    def apply_filesystem(self, spec: ServiceSpec, num_replicas: int,
+                         leaf_type: str) -> str:
         # TODO use spec.placement
         # TODO warn if spec.extended has entries we don't kow how
         #      to action.
+        all_hosts = self.get_hosts()
         def _update_fs(new: cfs.CephFilesystem) -> cfs.CephFilesystem:
             new.spec.metadataServer.activeCount = spec.placement.count or 1
+            new.spec.metadataServer.placement = cfs.Placement(
+                nodeAffinity=cfs.NodeAffinity(
+                    requiredDuringSchedulingIgnoredDuringExecution=cfs.RequiredDuringSchedulingIgnoredDuringExecution(
+                        nodeSelectorTerms=cfs.NodeSelectorTermsList(
+                            [placement_spec_to_node_selector(spec.placement, all_hosts)]
+                        )
+                    )
+                )
+            )
             return new
-
         def _create_fs() -> cfs.CephFilesystem:
-            return cfs.CephFilesystem(
+            fs = cfs.CephFilesystem(
                 apiVersion=self.rook_env.api_name,
                 metadata=dict(
                     name=spec.service_id,
                     namespace=self.rook_env.namespace,
                 ),
                 spec=cfs.Spec(
-                    None,
-                    None,
+                    dataPools=cfs.DataPoolsList(
+                        {
+                            cfs.DataPoolsItem(
+                                failureDomain=leaf_type,
+                                replicated=cfs.Replicated(
+                                    size=num_replicas
+                                )
+                            )
+                        }
+                    ),
+                    metadataPool=cfs.MetadataPool(
+                        failureDomain=leaf_type,
+                        replicated=cfs.Replicated(
+                            size=num_replicas
+                        )
+                    ),
                     metadataServer=cfs.MetadataServer(
                         activeCount=spec.placement.count or 1,
-                        activeStandby=True
+                        activeStandby=True,
+                        placement=
+                        cfs.Placement(
+                            nodeAffinity=cfs.NodeAffinity(
+                                requiredDuringSchedulingIgnoredDuringExecution=cfs.RequiredDuringSchedulingIgnoredDuringExecution(
+                                    nodeSelectorTerms=cfs.NodeSelectorTermsList(
+                                        [placement_spec_to_node_selector(spec.placement, all_hosts)]
+                                    )
+                                )
+                            )
+                        )
                     )
                 )
             )
+            return fs
         assert spec.service_id is not None
         return self._create_or_patch(
             cfs.CephFilesystem, 'cephfilesystems', spec.service_id,
@@ -971,12 +1029,15 @@ class RookCluster(object):
             cos.CephObjectStore, 'cephobjectstores', name,
             _update_zone, _create_zone)
 
-    def apply_nfsgw(self, spec: NFSServiceSpec) -> str:
+    def apply_nfsgw(self, spec: NFSServiceSpec, mgr: 'RookOrchestrator') -> str:
         # TODO use spec.placement
         # TODO warn if spec.extended has entries we don't kow how
         #      to action.
         # TODO Number of pods should be based on the list of hosts in the
         #      PlacementSpec.
+        assert spec.service_id, "service id in NFS service spec cannot be an empty string or None " # for mypy typing
+        service_id = spec.service_id
+        mgr_module = cast(Module, mgr)
         count = spec.placement.count or 1
         def _update_nfs(new: cnfs.CephNFS) -> cnfs.CephNFS:
             new.spec.server.active = count
@@ -991,7 +1052,7 @@ class RookCluster(object):
                         ),
                     spec=cnfs.Spec(
                         rados=cnfs.Rados(
-                            namespace=self.rook_env.namespace,
+                            namespace=service_id,
                             pool=NFS_POOL_NAME,
                             ),
                         server=cnfs.Server(
@@ -1000,12 +1061,12 @@ class RookCluster(object):
                         )
                     )
 
-            rook_nfsgw.spec.rados.namespace = cast(str, spec.service_id)
 
             return rook_nfsgw
 
-        assert spec.service_id is not None
-        return self._create_or_patch(cnfs.CephNFS, 'cephnfses', spec.service_id,
+        create_ganesha_pool(mgr)
+        NFSRados(mgr_module, service_id).write_obj('', f'conf-nfs.{spec.service_id}')
+        return self._create_or_patch(cnfs.CephNFS, 'cephnfses', service_id,
                 _update_nfs, _create_nfs)
 
     def rm_service(self, rooktype: str, service_id: str) -> str:
@@ -1046,24 +1107,20 @@ class RookCluster(object):
         assert drive_group.service_id
         storage_class = self.get_storage_class()
         inventory = self.get_discovered_devices()
-        self.creator: Optional[DefaultCreator] = None
-        if storage_class.metadata.labels and ('local.storage.openshift.io/owner-name' in storage_class.metadata.labels):
-            self.creator = LSOCreator(inventory, self.coreV1_api, self.storage_class)    
+        creator: Optional[DefaultCreator] = None
+        if (
+            storage_class.metadata.labels
+            and 'local.storage.openshift.io/owner-name' in storage_class.metadata.labels
+        ):
+            creator = LSOCreator(inventory, self.coreV1_api, self.storage_class)    
         else:
-            self.creator = DefaultCreator(inventory, self.coreV1_api, self.storage_class)
-        _add_osds = self.creator.add_osds(self.rook_pods, drive_group, matching_hosts)
-        with self.drive_group_lock:
-            self.drive_group_map[drive_group.service_id] = _add_osds
-            return self._patch(ccl.CephCluster, 'cephclusters', self.rook_env.cluster_name, _add_osds)
-
-    @threaded
-    def drive_group_loop(self) -> None:
-        ten_minutes = 10 * 60
-        while True:
-            sleep(ten_minutes)
-            with self.drive_group_lock:
-                for _, add_osd in self.drive_group_map.items():
-                    self._patch(ccl.CephCluster, 'cephclusters', self.rook_env.cluster_name, add_osd)
+            creator = DefaultCreator(inventory, self.coreV1_api, self.storage_class)
+        return self._patch(
+            ccl.CephCluster,
+            'cephclusters',
+            self.rook_env.cluster_name,
+            creator.add_osds(self.rook_pods, drive_group, matching_hosts)
+        )
 
     def remove_osds(self, osd_ids: List[str], replace: bool, force: bool, mon_command: Callable) -> str:
         inventory = self.get_discovered_devices()
@@ -1092,6 +1149,128 @@ class RookCluster(object):
             ret.append(spec)
         return ret
 
+    def create_zap_job(self, host: str, path: str) -> None:
+        body = client.V1Job(
+            api_version="batch/v1",
+            metadata=client.V1ObjectMeta(
+                name="rook-ceph-device-zap",
+                namespace="rook-ceph"
+            ),
+            spec=client.V1JobSpec(
+                template=client.V1PodTemplateSpec(
+                    spec=client.V1PodSpec(
+                        containers=[
+                            client.V1Container(
+                                name="device-zap",
+                                image="rook/ceph:master",
+                                command=["bash"],
+                                args=["-c", f"ceph-volume raw list {path} && dd if=/dev/zero of=\"{path}\" bs=1M count=1 oflag=direct,dsync || ceph-volume lvm zap --destroy {path}"],
+                                env=[
+                                    client.V1EnvVar(
+                                        name="ROOK_CEPH_USERNAME",
+                                        value_from=client.V1EnvVarSource(
+                                            secret_key_ref=client.V1SecretKeySelector(
+                                                key="ceph-username",
+                                                name="rook-ceph-mon"
+                                            )
+                                        )
+                                    ),
+                                    client.V1EnvVar(
+                                        name="ROOK_CEPH_SECRET",
+                                        value_from=client.V1EnvVarSource(
+                                            secret_key_ref=client.V1SecretKeySelector(
+                                                key="ceph-secret",
+                                                name="rook-ceph-mon"
+                                            )
+                                        )
+                                    )
+                                ],
+                                security_context=client.V1SecurityContext(
+                                    run_as_user=0,
+                                    privileged=True
+                                ),
+                                volume_mounts=[
+                                    client.V1VolumeMount(
+                                        mount_path="/etc/ceph",
+                                        name="ceph-conf-emptydir"
+                                    ),
+                                    client.V1VolumeMount(
+                                        mount_path="/etc/rook",
+                                        name="rook-config"
+                                    ),
+                                    client.V1VolumeMount(
+                                        mount_path="/dev",
+                                        name="devices"
+                                    )
+                                ]
+                            )
+                        ],
+                        volumes=[
+                            client.V1Volume(
+                                name="ceph-conf-emptydir",
+                                empty_dir=client.V1EmptyDirVolumeSource()
+                            ),
+                            client.V1Volume(
+                                name="rook-config",
+                                empty_dir=client.V1EmptyDirVolumeSource()
+                            ),
+                            client.V1Volume(
+                                name="devices",
+                                host_path=client.V1HostPathVolumeSource(
+                                    path="/dev"
+                                )
+                            ),
+                        ],
+                        node_selector={
+                            "kubernetes.io/hostname": host
+                        },
+                        restart_policy="Never"
+                    )
+                )
+            )
+        )
+        self.batchV1_api.create_namespaced_job('rook-ceph', body)
+
+    def rbd_mirror(self, spec: ServiceSpec) -> None:
+        service_id = spec.service_id or "default-rbd-mirror"
+        all_hosts = self.get_hosts()
+        def _create_rbd_mirror() -> crbdm.CephRBDMirror:
+            return crbdm.CephRBDMirror(
+                apiVersion=self.rook_env.api_name,
+                metadata=dict(
+                    name=service_id,
+                    namespace=self.rook_env.namespace,
+                ),
+                spec=crbdm.Spec(
+                    count=spec.placement.count or 1,
+                    placement=crbdm.Placement(
+                        nodeAffinity=crbdm.NodeAffinity(
+                            requiredDuringSchedulingIgnoredDuringExecution=crbdm.RequiredDuringSchedulingIgnoredDuringExecution(
+                                nodeSelectorTerms=crbdm.NodeSelectorTermsList(
+                                    [
+                                        placement_spec_to_node_selector(spec.placement, all_hosts)
+                                    ]
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        def _update_rbd_mirror(new: crbdm.CephRBDMirror) -> crbdm.CephRBDMirror:
+            new.spec.count = spec.placement.count or 1
+            new.spec.placement = crbdm.Placement(
+                nodeAffinity=crbdm.NodeAffinity(
+                    requiredDuringSchedulingIgnoredDuringExecution=crbdm.RequiredDuringSchedulingIgnoredDuringExecution(
+                        nodeSelectorTerms=crbdm.NodeSelectorTermsList(
+                            [
+                                placement_spec_to_node_selector(spec.placement, all_hosts)
+                            ]
+                        )
+                    )
+                )
+            )
+            return new
+        self._create_or_patch(crbdm.CephRBDMirror, 'cephrbdmirrors', service_id, _update_rbd_mirror, _create_rbd_mirror)
     def _patch(self, crd: Type, crd_name: str, cr_name: str, func: Callable[[CrdClassT, CrdClassT], CrdClassT]) -> str:
         current_json = self.rook_api_get(
             "{}/{}".format(crd_name, cr_name)

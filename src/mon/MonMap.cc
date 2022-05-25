@@ -53,10 +53,10 @@ void mon_info_t::encode(ceph::buffer::list& bl, uint64_t features) const
   uint8_t min_v = 1;
   if (!crush_loc.empty()) {
     // we added crush_loc in version 5, but need to let old clients decode it
-    // so just leave the min_v at version 4. Monitors are protected
+    // so just leave the min_v at version 1. Monitors are protected
     // from misunderstandings about location because setting it is blocked
     // on FEATURE_PINGING
-    min_v = 4;
+    min_v = 1;
   }
   if (!HAVE_FEATURE(features, SERVER_NAUTILUS)) {
     v = 2;
@@ -383,6 +383,9 @@ void MonMap::print(ostream& out) const
   if (stretch_mode_enabled) {
     out << "stretch_mode_enabled " << stretch_mode_enabled << "\n";
     out << "tiebreaker_mon " << tiebreaker_mon << "\n";
+  }
+  if (stretch_mode_enabled ||
+      !disallowed_leaders.empty()) {
     out << "disallowed_leaders " << disallowed_leaders << "\n";
   }
   unsigned i = 0;
@@ -757,6 +760,7 @@ seastar::future<> MonMap::read_monmap(const std::string& monmap)
 
 seastar::future<> MonMap::init_with_dns_srv(bool for_mkfs, const std::string& name)
 {
+  logger().debug("{}: for_mkfs={}, name={}", __func__, for_mkfs, name);
   string domain;
   string service = name;
   // check if domain is also provided and extract it from srv_name
@@ -823,6 +827,7 @@ bool MonMap::maybe_init_with_mon_host(const std::string& mon_host,
 seastar::future<> MonMap::build_monmap(const crimson::common::ConfigProxy& conf,
 				       bool for_mkfs)
 {
+  logger().debug("{}: for_mkfs={}", __func__, for_mkfs);
   // -m foo?
   if (maybe_init_with_mon_host(conf.get_val<std::string>("mon_host"), for_mkfs)) {
     return seastar::make_ready_future<>();
@@ -893,6 +898,8 @@ int MonMap::init_with_dns_srv(CephContext* cct,
 			      bool for_mkfs,
                               std::ostream& errout)
 {
+  lgeneric_dout(cct, 1) << __func__ << " srv_name: " << srv_name << dendl;
+
   string domain;
   // check if domain is also provided and extract it from srv_name
   size_t idx = srv_name.find("_");
@@ -923,6 +930,7 @@ int MonMap::init_with_dns_srv(CephContext* cct,
 
 int MonMap::build_initial(CephContext *cct, bool for_mkfs, ostream& errout)
 {
+  lgeneric_dout(cct, 1) << __func__ << " for_mkfs: " << for_mkfs << dendl;
   const auto& conf = cct->_conf;
 
   // mon_host_override?

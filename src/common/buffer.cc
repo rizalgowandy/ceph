@@ -1287,6 +1287,8 @@ static ceph::spinlock debug_lock;
 
   void buffer::list::claim_append(list& bl)
   {
+    // check overflow
+    assert(_len + bl._len >= _len);
     // steal the other guy's buffers
     _len += bl._len;
     _num += bl._num;
@@ -2029,6 +2031,33 @@ int buffer::list::write_fd(int fd, uint64_t offset) const
   return write_fd(fd);
 }
 #endif
+
+buffer::list::iov_vec_t buffer::list::prepare_iovs() const
+{
+  size_t index = 0;
+  uint64_t off = 0;
+  iov_vec_t iovs{_num / IOV_MAX + 1};
+  auto it = iovs.begin();
+  for (auto& bp : _buffers) {
+    if (index == 0) {
+      it->offset = off;
+      it->length = 0;
+      size_t nr_iov_created = std::distance(iovs.begin(), it);
+      it->iov.resize(
+	std::min(_num - IOV_MAX * nr_iov_created, (size_t)IOV_MAX));
+    }
+    it->iov[index].iov_base = (void*)bp.c_str();
+    it->iov[index].iov_len = bp.length();
+    off += bp.length();
+    it->length += bp.length();
+    if (++index == IOV_MAX) {
+      // continue with a new vector<iov> if we have more buf
+      ++it;
+      index = 0;
+    }
+  }
+  return iovs;
+}
 
 __u32 buffer::list::crc32c(__u32 crc) const
 {

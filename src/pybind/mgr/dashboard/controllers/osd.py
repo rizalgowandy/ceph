@@ -18,6 +18,7 @@ from ..tools import str_to_bool
 from . import APIDoc, APIRouter, CreatePermission, DeletePermission, Endpoint, \
     EndpointDoc, ReadPermission, RESTController, Task, UpdatePermission, \
     allow_empty_body
+from ._version import APIVersion
 from .orchestrator import raise_if_no_orchestrator
 
 logger = logging.getLogger('controllers.osd')
@@ -82,16 +83,29 @@ class Osd(RESTController):
             osd_spec = str(osd_id)
             if 'osd' not in osd:
                 continue  # pragma: no cover - simple early continue
-            for stat in ['osd.op_w', 'osd.op_in_bytes', 'osd.op_r', 'osd.op_out_bytes']:
-                prop = stat.split('.')[1]
-                rates = CephService.get_rates('osd', osd_spec, stat)
-                osd['stats'][prop] = get_most_recent_rate(rates)
-                osd['stats_history'][prop] = rates
-            # Gauge stats
-            for stat in ['osd.numpg', 'osd.stat_bytes', 'osd.stat_bytes_used']:
-                osd['stats'][stat.split('.')[1]] = mgr.get_latest('osd', osd_spec, stat)
+            self.gauge_stats(osd, osd_spec)
             osd['operational_status'] = self._get_operational_status(osd_id, removing_osd_ids)
         return list(osds.values())
+
+    @staticmethod
+    def gauge_stats(osd, osd_spec):
+        for stat in ['osd.op_w', 'osd.op_in_bytes', 'osd.op_r', 'osd.op_out_bytes']:
+            prop = stat.split('.')[1]
+            rates = CephService.get_rates('osd', osd_spec, stat)
+            osd['stats'][prop] = get_most_recent_rate(rates)
+            osd['stats_history'][prop] = rates
+            # Gauge stats
+        for stat in ['osd.numpg', 'osd.stat_bytes', 'osd.stat_bytes_used']:
+            osd['stats'][stat.split('.')[1]] = mgr.get_latest('osd', osd_spec, stat)
+
+    @RESTController.Collection('GET', version=APIVersion.EXPERIMENTAL)
+    @ReadPermission
+    def settings(self):
+        result = CephService.send_command('mon', 'osd dump')
+        return {
+            'nearfull_ratio': result['nearfull_ratio'],
+            'full_ratio': result['full_ratio']
+        }
 
     def _get_operational_status(self, osd_id: int, removing_osd_ids: Optional[List[int]]):
         if removing_osd_ids is None:

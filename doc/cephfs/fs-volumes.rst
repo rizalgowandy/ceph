@@ -10,7 +10,7 @@ storage administrators among others can use the common CLI provided by the
 ceph-mgr volumes module to manage the CephFS exports.
 
 The ceph-mgr volumes module implements the following file system export
-abstactions:
+abstractions:
 
 * FS volumes, an abstraction for CephFS file systems
 
@@ -78,6 +78,24 @@ remove MDSes using the enabled ceph-mgr orchestrator module.
 List volumes using::
 
     $ ceph fs volume ls
+
+Rename a volume using::
+
+    $ ceph fs volume rename <vol_name> <new_vol_name> [--yes-i-really-mean-it]
+
+Renaming a volume can be an expensive operation. It does the following:
+
+- renames the orchestrator managed MDS service to match the <new_vol_name>.
+  This involves launching a MDS service with <new_vol_name> and bringing down
+  the MDS service with <vol_name>.
+- renames the file system matching <vol_name> to <new_vol_name>
+- changes the application tags on the data and metadata pools of the file system
+  to <new_vol_name>
+- renames the  metadata and data pools of the file system.
+
+The CephX IDs authorized to <vol_name> need to be reauthorized to <new_vol_name>. Any
+on-going operations of the clients using these IDs may be disrupted. Mirroring is
+expected to be disabled on the volume.
 
 FS Subvolume groups
 -------------------
@@ -194,7 +212,7 @@ Fetch the absolute path of a subvolume using::
 
     $ ceph fs subvolume getpath <vol_name> <subvol_name> [--group_name <subvol_group_name>]
 
-Fetch the metadata of a subvolume using::
+Fetch the information of a subvolume using::
 
     $ ceph fs subvolume info <vol_name> <subvol_name> [--group_name <subvol_group_name>]
 
@@ -241,6 +259,31 @@ List subvolumes using::
     $ ceph fs subvolume ls <vol_name> [--group_name <subvol_group_name>]
 
 .. note:: subvolumes that are removed but have snapshots retained, are also listed.
+
+Set custom metadata on the subvolume as a key-value pair using::
+
+    $ ceph fs subvolume metadata set <vol_name> <subvol_name> <key_name> <value> [--group_name <subvol_group_name>]
+
+.. note:: If the key_name already exists then the old value will get replaced by the new value.
+
+.. note:: key_name and value should be a string of ASCII characters (as specified in python's string.printable). key_name is case-insensitive and always stored in lower case.
+
+.. note:: Custom metadata on a subvolume is not preserved when snapshotting the subvolume, and hence, is also not preserved when cloning the subvolume snapshot.
+
+Get custom metadata set on the subvolume using the metadata key::
+
+    $ ceph fs subvolume metadata get <vol_name> <subvol_name> <key_name> [--group_name <subvol_group_name>]
+
+List custom metadata (key-value pairs) set on the subvolume using::
+
+    $ ceph fs subvolume metadata ls <vol_name> <subvol_name> [--group_name <subvol_group_name>]
+
+Remove custom metadata set on the subvolume using the metadata key::
+
+    $ ceph fs subvolume metadata rm <vol_name> <subvol_name> <key_name> [--group_name <subvol_group_name>] [--force]
+
+Using the '--force' flag allows the command to succeed that would otherwise
+fail if the metadata key did not exist.
 
 Create a snapshot of a subvolume using::
 
@@ -322,8 +365,14 @@ A clone can be in one of the following states:
 #. `in-progress` : Clone operation is in progress
 #. `complete`    : Clone operation has successfully finished
 #. `failed`      : Clone operation has failed
+#. `canceled`    : Clone operation is cancelled by user
 
-Sample output from an `in-progress` clone operation::
+The reason for a clone failure is shown as below:
+
+#. `errno`     : error number
+#. `error_msg` : failure error string
+
+Sample output of an `in-progress` clone operation::
 
   $ ceph fs subvolume snapshot clone cephfs subvol1 snap1 clone1
   $ ceph fs clone status cephfs clone1
@@ -334,6 +383,28 @@ Sample output from an `in-progress` clone operation::
         "volume": "cephfs",
         "subvolume": "subvol1",
         "snapshot": "snap1"
+      }
+    }
+  }
+
+.. note:: The `failure` section will be shown only if the clone is in failed or cancelled state
+
+Sample output of a `failed` clone operation::
+
+  $ ceph fs subvolume snapshot clone cephfs subvol1 snap1 clone1
+  $ ceph fs clone status cephfs clone1
+  {
+    "status": {
+      "state": "failed",
+      "source": {
+        "volume": "cephfs",
+        "subvolume": "subvol1",
+        "snapshot": "snap1"
+        "size": "104857600"
+      },
+      "failure": {
+        "errno": "122",
+        "errstr": "Disk quota exceeded"
       }
     }
   }
@@ -359,13 +430,13 @@ To delete a partial clone use::
   $ ceph fs subvolume rm <vol_name> <clone_name> [--group_name <group_name>] --force
 
 .. note:: Cloning only synchronizes directories, regular files and symbolic links. Also, inode timestamps (access and
-          modification times) are synchronized upto seconds granularity.
+          modification times) are synchronized up to seconds granularity.
 
 An `in-progress` or a `pending` clone operation can be canceled. To cancel a clone operation use the `clone cancel` command::
 
   $ ceph fs clone cancel <vol_name> <clone_name> [--group_name <group_name>]
 
-On successful cancelation, the cloned subvolume is moved to `canceled` state::
+On successful cancellation, the cloned subvolume is moved to `canceled` state::
 
   $ ceph fs subvolume snapshot clone cephfs subvol1 snap1 clone1
   $ ceph fs clone cancel cephfs clone1
@@ -382,6 +453,40 @@ On successful cancelation, the cloned subvolume is moved to `canceled` state::
   }
 
 .. note:: The canceled cloned can be deleted by using --force option in `fs subvolume rm` command.
+
+
+.. _subvol-pinning:
+
+Pinning Subvolumes and Subvolume Groups
+---------------------------------------
+
+
+Subvolumes and subvolume groups can be automatically pinned to ranks according
+to policies. This can help distribute load across MDS ranks in predictable and
+stable ways.  Review :ref:`cephfs-pinning` and :ref:`cephfs-ephemeral-pinning`
+for details on how pinning works.
+
+Pinning is configured by::
+
+  $ ceph fs subvolumegroup pin <vol_name> <group_name> <pin_type> <pin_setting>
+
+or for subvolumes::
+
+  $ ceph fs subvolume pin <vol_name> <group_name> <pin_type> <pin_setting>
+
+Typically you will want to set subvolume group pins. The ``pin_type`` may be
+one of ``export``, ``distributed``, or ``random``. The ``pin_setting``
+corresponds to the extended attributed "value" as in the pinning documentation
+referenced above.
+
+So, for example, setting a distributed pinning strategy on a subvolume group::
+
+  $ ceph fs subvolumegroup pin cephfilesystem-a csi distributed 1
+
+Will enable distributed subtree partitioning policy for the "csi" subvolume
+group.  This will cause every subvolume within the group to be automatically
+pinned to one of the available ranks on the file system.
+
 
 .. _manila: https://github.com/openstack/manila
 .. _CSI: https://github.com/ceph/ceph-csi

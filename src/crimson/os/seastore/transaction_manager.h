@@ -24,34 +24,73 @@
 #include "crimson/os/seastore/segment_cleaner.h"
 #include "crimson/os/seastore/seastore_types.h"
 #include "crimson/os/seastore/cache.h"
-#include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/lba_manager.h"
+#include "crimson/os/seastore/backref_manager.h"
 #include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/extent_placement_manager.h"
+#include "crimson/os/seastore/device.h"
+#include "crimson/os/seastore/segment_manager_group.h"
 
 namespace crimson::os::seastore {
 class Journal;
 
+struct tm_make_config_t {
+  bool is_test = true;
+  journal_type_t j_type = journal_type_t::SEGMENT_JOURNAL;
+  placement_hint_t default_placement_hint = placement_hint_t::HOT;
+
+  static tm_make_config_t get_default() {
+    return tm_make_config_t {
+      false,
+      journal_type_t::SEGMENT_JOURNAL,
+      placement_hint_t::HOT
+    };
+  }
+  static tm_make_config_t get_test_segmented_journal() {
+    return tm_make_config_t {
+      true,
+      journal_type_t::SEGMENT_JOURNAL,
+      placement_hint_t::HOT
+    };
+  }
+  static tm_make_config_t get_test_cb_journal() {
+    return tm_make_config_t {
+      true,
+      journal_type_t::CIRCULARBOUNDED_JOURNAL,
+      placement_hint_t::REWRITE
+    };
+  }
+
+  tm_make_config_t(const tm_make_config_t &) = default;
+  tm_make_config_t &operator=(const tm_make_config_t &) = default;
+private:
+  tm_make_config_t(
+    bool is_test,
+    journal_type_t j_type,
+    placement_hint_t default_placement_hint)
+    : is_test(is_test), j_type(j_type),
+      default_placement_hint(default_placement_hint)
+  {}
+};
+
 template <typename F>
 auto repeat_eagain(F &&f) {
-  LOG_PREFIX("repeat_eagain");
   return seastar::do_with(
     std::forward<F>(f),
-    [FNAME](auto &f) {
-      return crimson::repeat(
-	[FNAME, &f] {
-	  return std::invoke(f
-	  ).safe_then([] {
-	    return seastar::stop_iteration::yes;
-	  }).handle_error(
-	    [FNAME](const crimson::ct_error::eagain &e) {
-	      DEBUG("hit eagain, restarting");
-	      return seastar::stop_iteration::no;
-	    },
-	    crimson::ct_error::pass_further_all{}
-	  );
-	});
+    [](auto &f)
+  {
+    return crimson::repeat([&f] {
+      return std::invoke(f
+      ).safe_then([] {
+        return seastar::stop_iteration::yes;
+      }).handle_error(
+        [](const crimson::ct_error::eagain &e) {
+          return seastar::stop_iteration::no;
+        },
+        crimson::ct_error::pass_further_all{}
+      );
     });
+  });
 }
 
 /**
@@ -66,13 +105,13 @@ public:
   using base_iertr = Cache::base_iertr;
 
   TransactionManager(
-    SegmentManager &segment_manager,
     SegmentCleanerRef segment_cleaner,
     JournalRef journal,
     CacheRef cache,
     LBAManagerRef lba_manager,
-    ExtentPlacementManagerRef&& epm,
-    ExtentReader& scanner);
+    ExtentPlacementManagerRef &&epm,
+    BackrefManagerRef&& backref_manager,
+    tm_make_config_t config = tm_make_config_t::get_default());
 
   /// Writes initial metadata to disk
   using mkfs_ertr = base_ertr;
@@ -88,14 +127,16 @@ public:
 
   /// Creates empty transaction
   TransactionRef create_transaction(
-      Transaction::src_t src) final {
-    return cache->create_transaction(src);
+      Transaction::src_t src,
+      const char* name) final {
+    return cache->create_transaction(src, name, false);
   }
 
   /// Creates empty weak transaction
   TransactionRef create_weak_transaction(
-      Transaction::src_t src) {
-    return cache->create_weak_transaction(src);
+      Transaction::src_t src,
+      const char* name) {
+    return cache->create_transaction(src, name, true);
   }
 
   /// Resets transaction
@@ -113,6 +154,8 @@ public:
   get_pin_ret get_pin(
     Transaction &t,
     laddr_t offset) {
+    LOG_PREFIX(TransactionManager::get_pin);
+    SUBTRACET(seastore_tm, "{}", t, offset);
     return lba_manager->get_mapping(t, offset);
   }
 
@@ -127,6 +170,8 @@ public:
     Transaction &t,
     laddr_t offset,
     extent_len_t length) {
+    LOG_PREFIX(TransactionManager::get_pins);
+    SUBDEBUGT(seastore_tm, "{}~{}", t, offset, length);
     return lba_manager->get_mappings(
       t, offset, length);
   }
@@ -146,19 +191,22 @@ public:
     Transaction &t,
     LBAPinRef pin) {
     LOG_PREFIX(TransactionManager::pin_to_extent);
+    SUBTRACET(seastore_tm, "getting extent {}", t, *pin);
     using ret = pin_to_extent_ret<T>;
-    DEBUGT("getting extent {}", t, *pin);
+    auto &pref = *pin;
     return cache->get_extent<T>(
       t,
-      pin->get_paddr(),
-      pin->get_length()
-    ).si_then([this, FNAME, &t, pin=std::move(pin)](auto ref) mutable -> ret {
-      if (!ref->has_pin()) {
-	assert(!(pin->has_been_invalidated() || ref->has_been_invalidated()));
-	ref->set_pin(std::move(pin));
-	lba_manager->add_pin(ref->get_pin());
+      pref.get_val(),
+      pref.get_length(),
+      [this, pin=std::move(pin)](T &extent) mutable {
+	assert(!extent.has_pin());
+	assert(!extent.has_been_invalidated());
+	assert(!pin->has_been_invalidated());
+	extent.set_pin(std::move(pin));
+	lba_manager->add_pin(extent.get_pin());
       }
-      DEBUGT("got extent {}", t, *ref);
+    ).si_then([FNAME, &t](auto ref) mutable -> ret {
+      SUBTRACET(seastore_tm, "got extent -- {}", t, *ref);
       return pin_to_extent_ret<T>(
 	interruptible::ready_future_marker{},
 	std::move(ref));
@@ -181,12 +229,14 @@ public:
     laddr_t offset,
     extent_len_t length) {
     LOG_PREFIX(TransactionManager::read_extent);
+    SUBTRACET(seastore_tm, "{}~{}", t, offset, length);
     return get_pin(
       t, offset
     ).si_then([this, FNAME, &t, offset, length] (auto pin) {
-      if (length != pin->get_length() || !pin->get_paddr().is_real()) {
-        ERRORT("offset {} len {} got wrong pin {}",
-               t, offset, length, *pin);
+      if (length != pin->get_length() || !pin->get_val().is_real()) {
+        SUBERRORT(seastore_tm,
+            "offset {} len {} got wrong pin {}",
+            t, offset, length, *pin);
         ceph_assert(0 == "Should be impossible");
       }
       return this->pin_to_extent<T>(t, std::move(pin));
@@ -203,12 +253,14 @@ public:
     Transaction &t,
     laddr_t offset) {
     LOG_PREFIX(TransactionManager::read_extent);
+    SUBTRACET(seastore_tm, "{}", t, offset);
     return get_pin(
       t, offset
     ).si_then([this, FNAME, &t, offset] (auto pin) {
-      if (!pin->get_paddr().is_real()) {
-        ERRORT("offset {} got wrong pin {}",
-               t, offset, *pin);
+      if (!pin->get_val().is_real()) {
+        SUBERRORT(seastore_tm,
+            "offset {} got wrong pin {}",
+            t, offset, *pin);
         ceph_assert(0 == "Should be impossible");
       }
       return this->pin_to_extent<T>(t, std::move(pin));
@@ -221,18 +273,16 @@ public:
     auto ret = cache->duplicate_for_write(
       t,
       ref)->cast<LogicalCachedExtent>();
-    stats.extents_mutated_total++;
-    stats.extents_mutated_bytes += ret->get_length();
     if (!ret->has_pin()) {
-      DEBUGT(
-	"duplicating {} for write: {}",
+      SUBDEBUGT(seastore_tm,
+	"duplicating extent for write -- {} -> {}",
 	t,
 	*ref,
 	*ret);
       ret->set_pin(ref->get_pin().duplicate());
     } else {
-      DEBUGT(
-	"{} already pending",
+      SUBTRACET(seastore_tm,
+	"extent is already duplicated -- {}",
 	t,
 	*ref);
       assert(ref->is_pending());
@@ -290,9 +340,13 @@ public:
                   T::TYPE == extent_types_t::COLL_BLOCK) {
       placement_hint = placement_hint_t::COLD;
     } else {
-      placement_hint = placement_hint_t::HOT;
+      placement_hint = config.default_placement_hint;
     }
-    auto ext = epm->alloc_new_extent<T>(
+    LOG_PREFIX(TransactionManager::alloc_extent);
+    SUBTRACET(seastore_tm, "{} len={}, placement_hint={}, laddr_hint={}",
+              t, T::TYPE, len, placement_hint, laddr_hint);
+    ceph_assert(is_aligned(laddr_hint, (uint64_t)epm->get_block_size()));
+    auto ext = cache->alloc_new_extent<T>(
       t,
       len,
       placement_hint);
@@ -301,12 +355,9 @@ public:
       laddr_hint,
       len,
       ext->get_paddr()
-    ).si_then([ext=std::move(ext), len, laddr_hint, &t, this](auto &&ref) mutable {
-      LOG_PREFIX(TransactionManager::alloc_extent);
+    ).si_then([ext=std::move(ext), laddr_hint, &t, FNAME](auto &&ref) mutable {
       ext->set_pin(std::move(ref));
-      stats.extents_allocated_total++;
-      stats.extents_allocated_bytes += len;
-      DEBUGT("new extent: {}, laddr_hint: {}", t, *ext, laddr_hint);
+      SUBDEBUGT(seastore_tm, "new extent: {}, laddr_hint: {}", t, *ext, laddr_hint);
       return alloc_extent_iertr::make_ready_future<TCachedExtentRef<T>>(
 	std::move(ext));
     });
@@ -318,11 +369,14 @@ public:
     Transaction &t,
     laddr_t hint,
     extent_len_t len) {
+    LOG_PREFIX(TransactionManager::reserve_region);
+    SUBDEBUGT(seastore_tm, "len={}, laddr_hint={}", t, len, hint);
+    ceph_assert(is_aligned(hint, (uint64_t)epm->get_block_size()));
     return lba_manager->alloc_extent(
       t,
       hint,
       len,
-      zero_paddr());
+      P_ADDR_ZERO);
   }
 
   /* alloc_extents
@@ -337,6 +391,9 @@ public:
      laddr_t hint,
      extent_len_t len,
      int num) {
+     LOG_PREFIX(TransactionManager::alloc_extents);
+     SUBDEBUGT(seastore_tm, "len={}, laddr_hint={}, num={}",
+               t, len, hint, num);
      return seastar::do_with(std::vector<TCachedExtentRef<T>>(),
        [this, &t, hint, len, num] (auto &extents) {
        return trans_intr::do_for_each(
@@ -365,7 +422,17 @@ public:
   /// SegmentCleaner::ExtentCallbackInterface
   using SegmentCleaner::ExtentCallbackInterface::submit_transaction_direct_ret;
   submit_transaction_direct_ret submit_transaction_direct(
-    Transaction &t) final;
+    Transaction &t,
+    std::optional<journal_seq_t> seq_to_trim = std::nullopt) final;
+
+  /**
+   * flush
+   *
+   * Block until all outstanding IOs on handle are committed.
+   * Note, flush() machinery must go through the same pipeline
+   * stages and locks as submit_transaction.
+   */
+  seastar::future<> flush(OrderingHandle &handle);
 
   using SegmentCleaner::ExtentCallbackInterface::get_next_dirty_extents_ret;
   get_next_dirty_extents_ret get_next_dirty_extents(
@@ -384,14 +451,7 @@ public:
     extent_types_t type,
     paddr_t addr,
     laddr_t laddr,
-    segment_off_t len) final;
-
-  using release_segment_ret =
-    SegmentCleaner::ExtentCallbackInterface::release_segment_ret;
-  release_segment_ret release_segment(
-    segment_id_t id) final {
-    return segment_manager.release(id);
-  }
+    seastore_off_t len) final;
 
   /**
    * read_root_meta
@@ -407,12 +467,15 @@ public:
     const std::string &key) {
     return cache->get_root(
       t
-    ).si_then([&key](auto root) {
+    ).si_then([&key, &t](auto root) {
+      LOG_PREFIX(TransactionManager::read_root_meta);
       auto meta = root->root.get_meta();
       auto iter = meta.find(key);
       if (iter == meta.end()) {
+        SUBDEBUGT(seastore_tm, "{} -> nullopt", t, key);
 	return seastar::make_ready_future<read_root_meta_bare>(std::nullopt);
       } else {
+        SUBDEBUGT(seastore_tm, "{} -> {}", t, key, iter->second);
 	return seastar::make_ready_future<read_root_meta_bare>(iter->second);
       }
     });
@@ -429,6 +492,8 @@ public:
     Transaction& t,
     const std::string& key,
     const std::string& value) {
+    LOG_PREFIX(TransactionManager::update_root_meta);
+    SUBDEBUGT(seastore_tm, "seastore_tm, {} -> {}", t, key, value);
     return cache->get_root(
       t
     ).si_then([this, &t, &key, &value](RootBlockRef root) {
@@ -450,8 +515,10 @@ public:
   using read_onode_root_iertr = base_iertr;
   using read_onode_root_ret = read_onode_root_iertr::future<laddr_t>;
   read_onode_root_ret read_onode_root(Transaction &t) {
-    return cache->get_root(t).si_then([](auto croot) {
+    return cache->get_root(t).si_then([&t](auto croot) {
+      LOG_PREFIX(TransactionManager::read_onode_root);
       laddr_t ret = croot->get_root().onode_root;
+      SUBTRACET(seastore_tm, "{}", t, ret);
       return ret;
     });
   }
@@ -462,6 +529,8 @@ public:
    * Write onode-tree root logical address, must be called after read.
    */
   void write_onode_root(Transaction &t, laddr_t addr) {
+    LOG_PREFIX(TransactionManager::write_onode_root);
+    SUBDEBUGT(seastore_tm, "{}", t, addr);
     auto croot = cache->get_root_fast(t);
     croot = cache->duplicate_for_write(t, croot)->cast<RootBlock>();
     croot->get_root().onode_root = addr;
@@ -476,8 +545,12 @@ public:
   using read_collection_root_ret = read_collection_root_iertr::future<
     coll_root_t>;
   read_collection_root_ret read_collection_root(Transaction &t) {
-    return cache->get_root(t).si_then([](auto croot) {
-      return croot->get_root().collection_root.get();
+    return cache->get_root(t).si_then([&t](auto croot) {
+      LOG_PREFIX(TransactionManager::read_collection_root);
+      auto ret = croot->get_root().collection_root.get();
+      SUBTRACET(seastore_tm, "{}~{}",
+                t, ret.get_location(), ret.get_size());
+      return ret;
     });
   }
 
@@ -487,31 +560,33 @@ public:
    * Update collection root addr
    */
   void write_collection_root(Transaction &t, coll_root_t cmroot) {
+    LOG_PREFIX(TransactionManager::write_collection_root);
+    SUBDEBUGT(seastore_tm, "{}~{}",
+              t, cmroot.get_location(), cmroot.get_size());
     auto croot = cache->get_root_fast(t);
     croot = cache->duplicate_for_write(t, croot)->cast<RootBlock>();
     croot->get_root().collection_root.update(cmroot);
   }
 
   extent_len_t get_block_size() const {
-    return segment_manager.get_block_size();
+    return epm->get_block_size();
   }
 
   store_statfs_t store_stat() const {
     return segment_cleaner->stat();
   }
 
-  void add_segment_manager(SegmentManager* sm) {
-    LOG_PREFIX(TransactionManager::add_segment_manager);
-    DEBUG("adding segment manager {}", sm->get_device_id());
-    scanner.add_segment_manager(sm);
-    epm->add_allocator(
-      device_type_t::SEGMENTED,
-      std::make_unique<SegmentedAllocator>(
-	*segment_cleaner,
-	*sm,
-	*lba_manager,
-	*journal,
-	*cache));
+  void add_device(Device* dev, bool is_primary) {
+    LOG_PREFIX(TransactionManager::add_device);
+    SUBDEBUG(seastore_tm, "adding device {}, is_primary={}",
+             dev->get_device_id(), is_primary);
+    epm->add_device(dev, is_primary);
+
+    if (dev->get_device_type() == device_type_t::SEGMENTED) {
+      auto sm = dynamic_cast<SegmentManager*>(dev);
+      ceph_assert(sm != nullptr);
+      sm_group.add_segment_manager(sm);
+    }
   }
 
   ~TransactionManager();
@@ -519,30 +594,17 @@ public:
 private:
   friend class Transaction;
 
-  // although there might be multiple devices backing seastore,
-  // only one of them are supposed to hold the journal. This
-  // segment manager is that device
-  SegmentManager &segment_manager;
   SegmentCleanerRef segment_cleaner;
   CacheRef cache;
   LBAManagerRef lba_manager;
   JournalRef journal;
   ExtentPlacementManagerRef epm;
-  ExtentReader& scanner;
+  BackrefManagerRef backref_manager;
+  SegmentManagerGroup &sm_group;
 
   WritePipeline write_pipeline;
 
-  struct {
-    uint64_t extents_retired_total = 0;
-    uint64_t extents_retired_bytes = 0;
-    uint64_t extents_mutated_total = 0;
-    uint64_t extents_mutated_bytes = 0;
-    uint64_t extents_allocated_total = 0;
-    uint64_t extents_allocated_bytes = 0;
-  } stats;
-  seastar::metrics::metric_group metrics;
-  void register_metrics();
-
+  tm_make_config_t config;
   rewrite_extent_ret rewrite_logical_extent(
     Transaction& t,
     LogicalCachedExtentRef extent);
@@ -555,7 +617,19 @@ public:
   auto get_lba_manager() {
     return lba_manager.get();
   }
+
+  auto get_backref_manager() {
+    return backref_manager.get();
+  }
+
+  auto get_cache() {
+    return cache.get();
+  }
+  auto get_journal() {
+    return journal.get();
+  }
 };
 using TransactionManagerRef = std::unique_ptr<TransactionManager>;
 
+TransactionManagerRef make_transaction_manager(tm_make_config_t config);
 }

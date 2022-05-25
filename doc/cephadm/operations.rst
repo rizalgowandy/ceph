@@ -178,30 +178,30 @@ running, but are not registered as hosts managed by *cephadm*.  This
 means that those services cannot currently be managed by cephadm
 (e.g., restarted, upgraded, included in `ceph orch ps`).
 
-You can manage the host(s) by running the following command:
+* You can manage the host(s) by running the following command:
 
-.. prompt:: bash #
+  .. prompt:: bash #
 
-  ceph orch host add *<hostname>*
+    ceph orch host add *<hostname>*
 
-.. note::
+  .. note::
 
-  You might need to configure SSH access to the remote host
-  before this will work.
+    You might need to configure SSH access to the remote host
+    before this will work.
 
-Alternatively, you can manually connect to the host and ensure that
-services on that host are removed or migrated to a host that is
-managed by *cephadm*.
+* See :ref:`cephadm-fqdn` for more information about host names and
+  domain names.
 
-This warning can be disabled entirely by running the following
-command:
+* Alternatively, you can manually connect to the host and ensure that
+  services on that host are removed or migrated to a host that is
+  managed by *cephadm*.
 
-.. prompt:: bash #
+* This warning can be disabled entirely by running the following
+  command:
 
-  ceph config set mgr mgr/cephadm/warn_on_stray_hosts false
+  .. prompt:: bash #
 
-See :ref:`cephadm-fqdn` for more information about host names and
-domain names.
+    ceph config set mgr mgr/cephadm/warn_on_stray_hosts false
 
 CEPHADM_STRAY_DAEMON
 ~~~~~~~~~~~~~~~~~~~~
@@ -212,16 +212,30 @@ tool, or because they were started manually.  Those
 services cannot currently be managed by cephadm (e.g., restarted,
 upgraded, or included in `ceph orch ps`).
 
-If the daemon is a stateful one (monitor or OSD), it should be adopted
-by cephadm; see :ref:`cephadm-adoption`.  For stateless daemons, it is
-usually easiest to provision a new daemon with the ``ceph orch apply``
-command and then stop the unmanaged daemon.
+* If the daemon is a stateful one (monitor or OSD), it should be adopted
+  by cephadm; see :ref:`cephadm-adoption`.  For stateless daemons, it is
+  usually easiest to provision a new daemon with the ``ceph orch apply``
+  command and then stop the unmanaged daemon.
 
-This warning can be disabled entirely by running the following command:
+* If the stray daemon(s) are running on hosts not managed by cephadm, you can manage the host(s) by running the following command:
 
-.. prompt:: bash #
+  .. prompt:: bash #
 
-  ceph config set mgr mgr/cephadm/warn_on_stray_daemons false
+    ceph orch host add *<hostname>*
+
+  .. note::
+
+    You might need to configure SSH access to the remote host
+    before this will work.
+
+* See :ref:`cephadm-fqdn` for more information about host names and
+  domain names.
+
+* This warning can be disabled entirely by running the following command:
+
+  .. prompt:: bash #
+
+    ceph config set mgr mgr/cephadm/warn_on_stray_daemons false
 
 CEPHADM_HOST_CHECK_FAILED
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -309,7 +323,7 @@ To list all the configuration checks and their current states, run the following
     NAME             HEALTHCHECK                      STATUS   DESCRIPTION
   kernel_security  CEPHADM_CHECK_KERNEL_LSM         enabled  checks SELINUX/Apparmor profiles are consistent across cluster hosts
   os_subscription  CEPHADM_CHECK_SUBSCRIPTION       enabled  checks subscription states are consistent for all cluster hosts
-  public_network   CEPHADM_CHECK_PUBLIC_MEMBERSHIP  enabled  check that all hosts have a NIC on the Ceph public_netork
+  public_network   CEPHADM_CHECK_PUBLIC_MEMBERSHIP  enabled  check that all hosts have a NIC on the Ceph public_network
   osd_mtu_size     CEPHADM_CHECK_MTU                enabled  check that OSD hosts share a common MTU setting
   osd_linkspeed    CEPHADM_CHECK_LINKSPEED          enabled  check that OSD hosts share a common linkspeed
   network_missing  CEPHADM_CHECK_NETWORK_MISSING    enabled  checks that the cluster/public networks defined exist on the Ceph hosts
@@ -504,3 +518,28 @@ For example, to distribute configs to hosts with the ``bare_config`` label, run 
   ceph config set mgr mgr/cephadm/manage_etc_ceph_ceph_conf_hosts label:bare_config
 
 (See :ref:`orchestrator-cli-placement-spec` for more information about placement specs.)
+
+Purging a cluster
+=================
+
+.. danger:: THIS OPERATION WILL DESTROY ALL DATA STORED IN THIS CLUSTER
+
+In order to destroy a cluster and delete all data stored in this cluster, disable
+cephadm to stop all orchestration operations (so we avoid deploying new daemons).
+
+.. prompt:: bash #
+
+  ceph mgr module disable cephadm
+
+Then verify the FSID of the cluster:
+
+.. prompt:: bash #
+
+  ceph fsid
+
+Purge ceph daemons from all hosts in the cluster
+
+.. prompt:: bash #
+
+  # For each host:
+  cephadm rm-cluster --force --zap-osds --fsid <fsid>

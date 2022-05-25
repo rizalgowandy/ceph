@@ -133,6 +133,7 @@ template <typename I>
 bool WriteLog<I>::initialize_pool(Context *on_finish,
                                   pwl::DeferredContexts &later) {
   int r;
+  CephContext *cct = m_image_ctx.cct;
 
   ceph_assert(ceph_mutex_is_locked_by_me(m_lock));
   if (access(this->m_log_pool_name.c_str(), F_OK) != 0) {
@@ -177,6 +178,7 @@ bool WriteLog<I>::initialize_pool(Context *on_finish,
     m_first_valid_entry = DATA_RING_BUFFER_OFFSET;
 
     auto new_root = std::make_shared<WriteLogPoolRoot>(pool_root);
+    new_root->layout_version = SSD_LAYOUT_VERSION;
     new_root->pool_size = this->m_log_pool_size;
     new_root->flushed_sync_gen = this->m_flushed_sync_gen;
     new_root->block_size = MIN_WRITE_ALLOC_SSD_SIZE;
@@ -187,25 +189,71 @@ bool WriteLog<I>::initialize_pool(Context *on_finish,
 
     r = update_pool_root_sync(new_root);
     if (r != 0) {
-      lderr(m_image_ctx.cct) << "failed to initialize pool ("
-                             << this->m_log_pool_name << ")" << dendl;
+      lderr(cct) << "failed to initialize pool ("
+                 << this->m_log_pool_name << ")" << dendl;
       bdev->close();
       delete bdev;
       on_finish->complete(r);
       return false;
     }
   } else {
-    m_cache_state->present = true;
+    ceph_assert(m_cache_state->present);
     r = create_and_open_bdev();
     if (r < 0) {
       on_finish->complete(r);
       return false;
     }
+
+    bufferlist bl;
+    SuperBlock superblock;
+    ::IOContext ioctx(cct, nullptr);
+    r = bdev->read(0, MIN_WRITE_ALLOC_SSD_SIZE, &bl, &ioctx, false);
+    if (r < 0) {
+      lderr(cct) << "read ssd cache superblock failed " << dendl;
+      goto err_close_bdev;
+    }
+    auto p = bl.cbegin();
+    decode(superblock, p);
+    pool_root = superblock.root;
+    ldout(cct, 1) << "Decoded root: pool_size=" << pool_root.pool_size
+                  << " first_valid_entry=" << pool_root.first_valid_entry
+                  << " first_free_entry=" << pool_root.first_free_entry
+                  << " flushed_sync_gen=" << pool_root.flushed_sync_gen
+                  << dendl;
+    ceph_assert(is_valid_pool_root(pool_root));
+    if (pool_root.layout_version != SSD_LAYOUT_VERSION) {
+      lderr(cct) << "pool layout version is "
+                 << pool_root.layout_version
+                 << " expected " << SSD_LAYOUT_VERSION
+                 << dendl;
+      goto err_close_bdev;
+    }
+    if (pool_root.block_size != MIN_WRITE_ALLOC_SSD_SIZE) {
+      lderr(cct) << "pool block size is " << pool_root.block_size
+                 << " expected " << MIN_WRITE_ALLOC_SSD_SIZE
+                 << dendl;
+      goto err_close_bdev;
+    }
+
+    this->m_log_pool_size = pool_root.pool_size;
+    this->m_flushed_sync_gen = pool_root.flushed_sync_gen;
+    this->m_first_valid_entry = pool_root.first_valid_entry;
+    this->m_first_free_entry = pool_root.first_free_entry;
+    this->m_bytes_allocated_cap = this->m_log_pool_size -
+                                  DATA_RING_BUFFER_OFFSET -
+                                  MIN_WRITE_ALLOC_SSD_SIZE;
+
     load_existing_entries(later);
     m_cache_state->clean = this->m_dirty_log_entries.empty();
     m_cache_state->empty = m_log_entries.empty();
   }
   return true;
+
+err_close_bdev:
+  bdev->close();
+  delete bdev;
+  on_finish->complete(-EINVAL);
+  return false;
 }
 
 template <typename I>
@@ -223,8 +271,6 @@ void WriteLog<I>::remove_pool_file() {
       lderr(m_image_ctx.cct) << "failed to remove empty pool \""
                              << this->m_log_pool_name << "\": " << dendl;
     } else {
-      m_cache_state->clean = true;
-      m_cache_state->empty = true;
       m_cache_state->present = false;
     }
   } else {
@@ -235,33 +281,8 @@ void WriteLog<I>::remove_pool_file() {
 
 template <typename I>
 void WriteLog<I>::load_existing_entries(pwl::DeferredContexts &later) {
-  bufferlist bl;
   CephContext *cct = m_image_ctx.cct;
-  ::IOContext ioctx(cct, nullptr);
-  bdev->read(0, MIN_WRITE_ALLOC_SSD_SIZE, &bl, &ioctx, false);
-  SuperBlock superblock;
-
-  auto p = bl.cbegin();
-  decode(superblock, p);
-
-  pool_root = superblock.root;
-  ldout(cct, 1) << "Decoded root: pool_size=" << pool_root.pool_size
-                << " first_valid_entry=" << pool_root.first_valid_entry
-                << " first_free_entry=" << pool_root.first_free_entry
-                << " flushed_sync_gen=" << pool_root.flushed_sync_gen
-                << dendl;
-  ceph_assert(is_valid_pool_root(pool_root));
-
-  this->m_log_pool_size = pool_root.pool_size;
-  this->m_flushed_sync_gen = pool_root.flushed_sync_gen;
-  this->m_first_valid_entry = pool_root.first_valid_entry;
-  this->m_first_free_entry = pool_root.first_free_entry;
-
-  this->m_bytes_allocated_cap = this->m_log_pool_size -
-      DATA_RING_BUFFER_OFFSET - MIN_WRITE_ALLOC_SSD_SIZE;
-
   std::map<uint64_t, std::shared_ptr<SyncPointLogEntry>> sync_point_entries;
-
   std::map<uint64_t, bool> missing_sync_points;
 
   // Iterate through the log_entries and append all the write_bytes
@@ -423,8 +444,8 @@ void WriteLog<I>::append_scheduled_ops(void) {
   GenericLogOperations ops;
   ldout(m_image_ctx.cct, 20) << dendl;
 
-  bool ops_remain = false; //no-op variable for SSD
-  bool appending = false; //no-op variable for SSD
+  bool ops_remain = false;  // unused, no-op variable for SSD
+  bool appending = false;   // unused, no-op variable for SSD
   this->append_scheduled(ops, ops_remain, appending);
 
   if (ops.size()) {
@@ -448,8 +469,6 @@ void WriteLog<I>::append_op_log_entries(GenericLogOperations &ops) {
   Context *ctx = new LambdaContext([this, ops](int r) {
     assert(r == 0);
     ldout(m_image_ctx.cct, 20) << "Finished root update " << dendl;
-    this->m_async_update_superblock--;
-    this->m_async_op_tracker.finish_op();
 
     auto captured_ops = std::move(ops);
     this->complete_op_log_entries(std::move(captured_ops), r);
@@ -469,6 +488,8 @@ void WriteLog<I>::append_op_log_entries(GenericLogOperations &ops) {
     if (need_finisher) {
       this->enlist_op_appender();
     }
+    this->m_async_update_superblock--;
+    this->m_async_op_tracker.finish_op();
   });
   uint64_t *new_first_free_entry = new(uint64_t);
   Context *append_ctx = new LambdaContext(
@@ -481,8 +502,6 @@ void WriteLog<I>::append_op_log_entries(GenericLogOperations &ops) {
         for (auto &operation : ops) {
           operation->log_append_comp_time = now;
         }
-        this->m_async_append_ops--;
-        this->m_async_op_tracker.finish_op();
 
         std::lock_guard locker(this->m_log_append_lock);
         std::lock_guard locker1(m_lock);
@@ -494,6 +513,8 @@ void WriteLog<I>::append_op_log_entries(GenericLogOperations &ops) {
         delete new_first_free_entry;
         schedule_update_root(new_root, ctx);
       }
+      this->m_async_append_ops--;
+      this->m_async_op_tracker.finish_op();
     });
   // Append logs and update first_free_update
   append_ops(ops, append_ctx, new_first_free_entry);
@@ -514,56 +535,106 @@ void WriteLog<I>::alloc_op_log_entries(GenericLogOperations &ops) {
 
   for (auto &operation : ops) {
     auto &log_entry = operation->get_log_entry();
-    log_entry->ram_entry.entry_valid = 1;
+    log_entry->ram_entry.set_entry_valid(true);
     m_log_entries.push_back(log_entry);
     ldout(m_image_ctx.cct, 20) << "operation=[" << *operation << "]" << dendl;
+  }
+  if (m_cache_state->empty && !m_log_entries.empty()) {
+    m_cache_state->empty = false;
+    this->update_image_cache_state();
   }
 }
 
 template <typename I>
-Context* WriteLog<I>::construct_flush_entry_ctx(
-    std::shared_ptr<GenericLogEntry> log_entry) {
+void WriteLog<I>::construct_flush_entries(pwl::GenericLogEntries entries_to_flush,
+					  DeferredContexts &post_unlock,
+					  bool has_write_entry) {
   // snapshot so we behave consistently
   bool invalidating = this->m_invalidating;
 
-  Context *ctx = this->construct_flush_entry(log_entry, invalidating);
+  if (invalidating || !has_write_entry) {
+    for (auto &log_entry : entries_to_flush) {
+      GuardedRequestFunctionContext *guarded_ctx =
+        new GuardedRequestFunctionContext([this, log_entry, invalidating]
+          (GuardedRequestFunctionContext &guard_ctx) {
+            log_entry->m_cell = guard_ctx.cell;
+            Context *ctx = this->construct_flush_entry(log_entry, invalidating);
 
-  if (invalidating) {
-    return ctx;
-  }
-  if (log_entry->is_write_entry()) {
-    bufferlist *read_bl_ptr = new bufferlist;
-    ctx = new LambdaContext(
-      [this, log_entry, read_bl_ptr, ctx](int r) {
-        bufferlist captured_entry_bl;
-        captured_entry_bl.claim_append(*read_bl_ptr);
-        delete read_bl_ptr;
-        m_image_ctx.op_work_queue->queue(new LambdaContext(
-          [this, log_entry, entry_bl=move(captured_entry_bl), ctx](int r) {
-            auto captured_entry_bl = std::move(entry_bl);
-            ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
-                                       << " " << *log_entry << dendl;
-            log_entry->writeback_bl(this->m_image_writeback, ctx,
-                                    std::move(captured_entry_bl));
-          }), 0);
-      });
-    ctx = new LambdaContext(
-      [this, log_entry, read_bl_ptr, ctx](int r) {
-        auto write_entry = static_pointer_cast<WriteLogEntry>(log_entry);
-        write_entry->inc_bl_refs();
-        aio_read_data_block(std::move(write_entry), read_bl_ptr, ctx);
-      });
-    return ctx;
+            if (!invalidating) {
+              ctx = new LambdaContext([this, log_entry, ctx](int r) {
+                m_image_ctx.op_work_queue->queue(new LambdaContext(
+	          [this, log_entry, ctx](int r) {
+	            ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
+                                               << " " << *log_entry << dendl;
+	            log_entry->writeback(this->m_image_writeback, ctx);
+	          }), 0);
+	      });
+            }
+            ctx->complete(0);
+        });
+      this->detain_flush_guard_request(log_entry, guarded_ctx);
+    }
   } else {
-    return new LambdaContext(
-      [this, log_entry, ctx](int r) {
-        m_image_ctx.op_work_queue->queue(new LambdaContext(
-          [this, log_entry, ctx](int r) {
-            ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
-                                       << " " << *log_entry << dendl;
-            log_entry->writeback(this->m_image_writeback, ctx);
-          }), 0);
+    int count = entries_to_flush.size();
+    std::vector<std::shared_ptr<GenericWriteLogEntry>> write_entries;
+    std::vector<bufferlist *> read_bls;
+
+    write_entries.reserve(count);
+    read_bls.reserve(count);
+
+    for (auto &log_entry : entries_to_flush) {
+      if (log_entry->is_write_entry()) {
+	bufferlist *bl = new bufferlist;
+	auto write_entry = static_pointer_cast<WriteLogEntry>(log_entry);
+	write_entry->inc_bl_refs();
+	write_entries.push_back(write_entry);
+	read_bls.push_back(bl);
+      }
+    }
+
+    Context *ctx = new LambdaContext(
+      [this, entries_to_flush, read_bls](int r) {
+        int i = 0;
+	GuardedRequestFunctionContext *guarded_ctx = nullptr;
+
+	for (auto &log_entry : entries_to_flush) {
+	  if (log_entry->is_write_entry()) {
+	    bufferlist captured_entry_bl;
+	    captured_entry_bl.claim_append(*read_bls[i]);
+	    delete read_bls[i++];
+
+	    guarded_ctx = new GuardedRequestFunctionContext([this, log_entry, captured_entry_bl]
+              (GuardedRequestFunctionContext &guard_ctx) {
+                log_entry->m_cell = guard_ctx.cell;
+                Context *ctx = this->construct_flush_entry(log_entry, false);
+
+	        m_image_ctx.op_work_queue->queue(new LambdaContext(
+	          [this, log_entry, entry_bl=std::move(captured_entry_bl), ctx](int r) {
+		    auto captured_entry_bl = std::move(entry_bl);
+		    ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
+			                       << " " << *log_entry << dendl;
+		    log_entry->writeback_bl(this->m_image_writeback, ctx,
+                                            std::move(captured_entry_bl));
+	          }), 0);
+	      });
+	  } else {
+	    guarded_ctx = new GuardedRequestFunctionContext([this, log_entry]
+              (GuardedRequestFunctionContext &guard_ctx) {
+                log_entry->m_cell = guard_ctx.cell;
+                Context *ctx = this->construct_flush_entry(log_entry, false);
+	        m_image_ctx.op_work_queue->queue(new LambdaContext(
+		  [this, log_entry, ctx](int r) {
+		    ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
+                                               << " " << *log_entry << dendl;
+		    log_entry->writeback(this->m_image_writeback, ctx);
+		  }), 0);
+            });
+	  }
+          this->detain_flush_guard_request(log_entry, guarded_ctx);
+	}
       });
+
+    aio_read_data_blocks(write_entries, read_bls, ctx);
   }
 }
 
@@ -621,8 +692,8 @@ template <typename I>
 bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
   CephContext *cct = m_image_ctx.cct;
   GenericLogEntriesVector retiring_entries;
-  uint32_t initial_first_valid_entry;
-  uint32_t first_valid_entry;
+  uint64_t initial_first_valid_entry;
+  uint64_t first_valid_entry;
 
   std::lock_guard retire_locker(this->m_log_retire_lock);
   ldout(cct, 20) << "Look for entries to retire" << dendl;
@@ -744,24 +815,28 @@ bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
           this->m_bytes_allocated -= allocated_bytes;
           ceph_assert(this->m_bytes_cached >= cached_bytes);
           this->m_bytes_cached -= cached_bytes;
+          if (!m_cache_state->empty && m_log_entries.empty()) {
+            m_cache_state->empty = true;
+            this->update_image_cache_state();
+          }
 
           ldout(m_image_ctx.cct, 20)
-            << "Finished root update: " << "initial_first_valid_entry="
-            << initial_first_valid_entry << ", " << "m_first_valid_entry="
-            << m_first_valid_entry << "," << "release space = "
-            << allocated_bytes << "," << "m_bytes_allocated="
-            << m_bytes_allocated << "," << "release cached space="
-            << cached_bytes << "," << "m_bytes_cached="
+            << "Finished root update: initial_first_valid_entry="
+            << initial_first_valid_entry << ", m_first_valid_entry="
+            << m_first_valid_entry << ", release space = "
+            << allocated_bytes << ", m_bytes_allocated="
+            << m_bytes_allocated << ", release cached space="
+            << cached_bytes << ", m_bytes_cached="
             << this->m_bytes_cached << dendl;
 
           this->m_alloc_failed_since_retire = false;
           this->wake_up();
-          m_async_update_superblock--;
-          this->m_async_op_tracker.finish_op();
         }
 
         this->dispatch_deferred_writes();
         this->process_writeback_dirty_entries();
+        m_async_update_superblock--;
+        this->m_async_op_tracker.finish_op();
       });
 
     std::lock_guard locker(m_lock);
@@ -957,7 +1032,7 @@ void WriteLog<I>::update_root_scheduled_ops() {
   });
   Context *append_ctx = new LambdaContext([this, ctx](int r) {
     ldout(m_image_ctx.cct, 15) << "Finish the update of pool root." << dendl;
-    bool need_finisher = false;;
+    bool need_finisher = false;
     assert(r == 0);
     {
       std::lock_guard locker(m_lock);

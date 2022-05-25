@@ -24,16 +24,15 @@ constexpr const char* RequestLogAction{"Log"};
 
 int RequestLog(lua_State* L) 
 {
-  const auto store = reinterpret_cast<rgw::sal::RadosStore*>(lua_touserdata(L, lua_upvalueindex(1)));
-  const auto rest = reinterpret_cast<RGWREST*>(lua_touserdata(L, lua_upvalueindex(2)));
-  const auto olog = reinterpret_cast<OpsLogSocket*>(lua_touserdata(L, lua_upvalueindex(3)));
-  const auto s = reinterpret_cast<req_state*>(lua_touserdata(L, lua_upvalueindex(4)));
-  const std::string op_name(reinterpret_cast<const char*>(lua_touserdata(L, lua_upvalueindex(5))));
-  if (store && s) {
-    const auto rc = rgw_log_op(store, rest, s, op_name, olog);
+  const auto rest = reinterpret_cast<RGWREST*>(lua_touserdata(L, lua_upvalueindex(1)));
+  const auto olog = reinterpret_cast<OpsLogSink*>(lua_touserdata(L, lua_upvalueindex(2)));
+  const auto s = reinterpret_cast<req_state*>(lua_touserdata(L, lua_upvalueindex(3)));
+  const std::string op_name(reinterpret_cast<const char*>(lua_touserdata(L, lua_upvalueindex(4))));
+  if (s) {
+    const auto rc = rgw_log_op(rest, s, op_name, olog);
     lua_pushinteger(L, rc);
   } else {
-    ldpp_dout(s, 1) << "Lua ERROR: missing rados store, cannot use ops log"  << dendl;
+    ldpp_dout(s, 1) << "Lua ERROR: missing request state, cannot use ops log"  << dendl;
     lua_pushinteger(L, -EINVAL);
   }
 
@@ -147,6 +146,37 @@ struct UserMetaTable : public EmptyMetaTable {
   }
 };
 
+struct TraceMetaTable : public EmptyMetaTable {
+  static std::string TableName() {return "Trace";}
+  static std::string Name() {return TableName() + "Meta";}
+
+  static int IndexClosure(lua_State* L) {
+    const auto s = reinterpret_cast<req_state*>(lua_touserdata(L, lua_upvalueindex(1)));
+
+    const char* index = luaL_checkstring(L, 2);
+
+    if (strcasecmp(index, "Enable") == 0) {
+      lua_pushboolean(L, s->trace_enabled);
+    } else {
+      return error_unknown_field(L, index, TableName());
+    }
+    return ONE_RETURNVAL;
+  }
+
+  static int NewIndexClosure(lua_State* L) {
+    const auto s = reinterpret_cast<req_state*>(lua_touserdata(L, lua_upvalueindex(1)));
+
+    const char* index = luaL_checkstring(L, 2);
+
+    if (strcasecmp(index, "Enable") == 0) {
+      s->trace_enabled = lua_toboolean(L, 3);
+    } else {
+      return error_unknown_field(L, index, TableName());
+    }
+    return NO_RETURNVAL;
+  }
+};
+
 struct OwnerMetaTable : public EmptyMetaTable {
   static std::string TableName() {return "Owner";}
   static std::string Name() {return TableName() + "Meta";}
@@ -171,14 +201,19 @@ struct BucketMetaTable : public EmptyMetaTable {
   static std::string TableName() {return "Bucket";}
   static std::string Name() {return TableName() + "Meta";}
 
-  using Type = rgw::sal::Bucket;
-
   static int IndexClosure(lua_State* L) {
-    const auto bucket = reinterpret_cast<Type*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const auto s = reinterpret_cast<req_state*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const auto bucket = s->bucket.get();
 
     const char* index = luaL_checkstring(L, 2);
 
-    if (strcasecmp(index, "Tenant") == 0) {
+    if (rgw::sal::Bucket::empty(bucket)) {
+      if (strcasecmp(index, "Name") == 0) {
+        pushstring(L, s->init_state.url_bucket);
+      } else {
+        lua_pushnil(L);
+      }
+    } else if (strcasecmp(index, "Tenant") == 0) {
       pushstring(L, bucket->get_tenant());
     } else if (strcasecmp(index, "Name") == 0) {
       pushstring(L, bucket->get_name());
@@ -640,10 +675,25 @@ struct HTTPMetaTable : public EmptyMetaTable {
       pushstring(L, info->request_params);
     } else if (strcasecmp(index, "Domain") == 0) {
       pushstring(L, info->domain);
+    } else if (strcasecmp(index, "StorageClass") == 0) {
+      pushstring(L, info->storage_class);
     } else {
       return error_unknown_field(L, index, TableName());
     }
     return ONE_RETURNVAL;
+  }
+
+  static int NewIndexClosure(lua_State* L) {
+    auto info = reinterpret_cast<req_info*>(lua_touserdata(L, lua_upvalueindex(1)));
+
+    const char* index = luaL_checkstring(L, 2);
+
+    if (strcasecmp(index, "StorageClass") == 0) {
+      info->storage_class = luaL_checkstring(L, 3);
+   } else {
+      return error_unknown_field(L, index, TableName());
+   }
+    return NO_RETURNVAL;
   }
 };
 
@@ -717,7 +767,7 @@ struct RequestMetaTable : public EmptyMetaTable {
         lua_pushnil(L);
       }
     } else if (strcasecmp(index, "Bucket") == 0) {
-      create_metatable<BucketMetaTable>(L, false, s->bucket);
+      create_metatable<BucketMetaTable>(L, false, s);
     } else if (strcasecmp(index, "Object") == 0) {
       create_metatable<ObjectMetaTable>(L, false, s->object);
     } else if (strcasecmp(index, "CopyFrom") == 0) {
@@ -767,6 +817,8 @@ struct RequestMetaTable : public EmptyMetaTable {
       } else {
         create_metatable<UserMetaTable>(L, false, const_cast<rgw_user*>(&(s->user->get_id())));
       }
+    } else if (strcasecmp(index, "Trace") == 0) {
+        create_metatable<TraceMetaTable>(L, false, s);
     } else {
       return error_unknown_field(L, index, TableName());
     }
@@ -777,7 +829,7 @@ struct RequestMetaTable : public EmptyMetaTable {
 int execute(
     rgw::sal::Store* store,
     RGWREST* rest,
-    OpsLogSocket* olog,
+    OpsLogSink* olog,
     req_state* s, 
     const char* op_name,
     const std::string& script)
@@ -799,12 +851,11 @@ int execute(
   lua_getglobal(L, RequestMetaTable::TableName().c_str());
   ceph_assert(lua_istable(L, -1));
   pushstring(L, RequestLogAction);
-  lua_pushlightuserdata(L, store);
   lua_pushlightuserdata(L, rest);
   lua_pushlightuserdata(L, olog);
   lua_pushlightuserdata(L, s);
   lua_pushlightuserdata(L, const_cast<char*>(op_name));
-  lua_pushcclosure(L, RequestLog, FIVE_UPVALS);
+  lua_pushcclosure(L, RequestLog, FOUR_UPVALS);
   lua_rawset(L, -3);
 
   try {

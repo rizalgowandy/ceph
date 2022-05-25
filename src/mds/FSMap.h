@@ -189,7 +189,8 @@ public:
   void print(std::ostream& out) const;
 
   bool is_upgradeable() const {
-    return !mds_map.allows_standby_replay() && mds_map.get_num_in_mds() <= 1;
+    return (mds_map.allows_standby_replay() && mds_map.get_num_in_mds() == 0)
+       || (!mds_map.allows_standby_replay() && mds_map.get_num_in_mds() <= 1);
   }
 
   /**
@@ -568,7 +569,7 @@ public:
    * Assert that the FSMap, Filesystem, MDSMap, mds_info_t relations are
    * all self-consistent.
    */
-  void sanity() const;
+  void sanity(bool pending=false) const;
 
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& p);

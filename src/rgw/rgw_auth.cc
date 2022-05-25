@@ -373,8 +373,8 @@ void rgw::auth::WebIdentityApplier::create_account(const DoutPrefixProvider* dpp
   user->get_info().type = TYPE_WEB;
   user->get_info().max_buckets =
     cct->_conf.get_val<int64_t>("rgw_user_max_buckets");
-  rgw_apply_default_bucket_quota(user->get_info().bucket_quota, cct->_conf);
-  rgw_apply_default_user_quota(user->get_info().user_quota, cct->_conf);
+  rgw_apply_default_bucket_quota(user->get_info().quota.bucket_quota, cct->_conf);
+  rgw_apply_default_user_quota(user->get_info().quota.user_quota, cct->_conf);
 
   int ret = user->store_user(dpp, null_yield, true);
   if (ret < 0) {
@@ -650,8 +650,8 @@ void rgw::auth::RemoteApplier::create_account(const DoutPrefixProvider* dpp,
   }
   user->get_info().max_buckets =
     cct->_conf.get_val<int64_t>("rgw_user_max_buckets");
-  rgw_apply_default_bucket_quota(user->get_info().bucket_quota, cct->_conf);
-  rgw_apply_default_user_quota(user->get_info().user_quota, cct->_conf);
+  rgw_apply_default_bucket_quota(user->get_info().quota.bucket_quota, cct->_conf);
+  rgw_apply_default_user_quota(user->get_info().quota.user_quota, cct->_conf);
   user_info = user->get_info();
 
   int ret = user->store_user(dpp, null_yield, true);
@@ -911,7 +911,7 @@ rgw::auth::AnonymousEngine::authenticate(const DoutPrefixProvider* dpp, const re
     auto apl = \
       apl_factory->create_apl_local(cct, s, user_info,
                                     rgw::auth::LocalApplier::NO_SUBUSER,
-                                    boost::none);
+                                    std::nullopt);
     return result_t::grant(std::move(apl));
   }
 }

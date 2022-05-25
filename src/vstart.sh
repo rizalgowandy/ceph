@@ -42,7 +42,7 @@ if [ -n "$VSTART_DEST" ]; then
     CEPH_CONF_PATH=$VSTART_DEST
     CEPH_DEV_DIR=$VSTART_DEST/dev
     CEPH_OUT_DIR=$VSTART_DEST/out
-    CEPH_ASOK_DIR=$VSTART_DEST/out
+    CEPH_ASOK_DIR=$VSTART_DEST/asok
 fi
 
 get_cmake_variable() {
@@ -128,6 +128,7 @@ fi
 [ -z "$CEPH_DIR" ] && CEPH_DIR="$PWD"
 [ -z "$CEPH_DEV_DIR" ] && CEPH_DEV_DIR="$CEPH_DIR/dev"
 [ -z "$CEPH_OUT_DIR" ] && CEPH_OUT_DIR="$CEPH_DIR/out"
+[ -z "$CEPH_ASOK_DIR" ] && CEPH_ASOK_DIR="$CEPH_DIR/asok"
 [ -z "$CEPH_RGW_PORT" ] && CEPH_RGW_PORT=8000
 [ -z "$CEPH_CONF_PATH" ] && CEPH_CONF_PATH=$CEPH_DIR
 
@@ -150,6 +151,7 @@ short=0
 ec=0
 cephadm=0
 parallel=true
+restart=1
 hitset=""
 overwrite_conf=0
 cephx=1 #turn cephx on by default
@@ -164,7 +166,8 @@ ceph_osd=ceph-osd
 rgw_frontend="beast"
 rgw_compression=""
 lockdep=${LOCKDEP:-1}
-spdk_enabled=0 #disable SPDK by default
+spdk_enabled=0 # disable SPDK by default
+pmem_enabled=0
 zoned_enabled=0
 io_uring_enabled=0
 with_jaeger=0
@@ -199,7 +202,7 @@ read -r -d '' usage <<EOF || true
 usage: $0 [option]... \nex: MON=3 OSD=1 MDS=1 MGR=1 RGW=1 NFS=1 $0 -n -d
 options:
 	-d, --debug
-        -t, --trace
+	-t, --trace
 	-s, --standby_mds: Generate standby-replay MDS for each active
 	-l, --localhost: use localhost instead of hostname
 	-i <ip>: bind to specific ip
@@ -232,11 +235,12 @@ options:
 	--multimds <count> allow multimds with maximum active count
 	--without-dashboard: do not run using mgr dashboard
 	--bluestore-spdk: enable SPDK and with a comma-delimited list of PCI-IDs of NVME device (e.g, 0000:81:00.0)
+	--bluestore-pmem: enable PMEM and with path to a file mapped to PMEM
 	--msgr1: use msgr1 only
 	--msgr2: use msgr2 only
 	--msgr21: use msgr2 and msgr1
 	--crimson: use crimson-osd instead of ceph-osd
-    --crimson-foreground: use crimson-osd, but run it in the foreground
+	--crimson-foreground: use crimson-osd, but run it in the foreground
 	--osd-args: specify any extra osd specific options
 	--bluestore-devs: comma-separated list of blockdevs to use for bluestore
 	--bluestore-zoned: blockdevs listed by --bluestore-devs are zoned devices (HM-SMR HDD or ZNS SSD)
@@ -244,9 +248,11 @@ options:
 	--inc-osd: append some more osds into existing vcluster
 	--cephadm: enable cephadm orchestrator with ~/.ssh/id_rsa[.pub]
 	--no-parallel: dont start all OSDs in parallel
+	--no-restart: dont restart process when using ceph-run
 	--jaeger: use jaegertracing for tracing
 	--seastore-devs: comma-separated list of blockdevs to use for seastore
-        --seastore-secondary-des: comma-separated list of secondary blockdevs to use for seastore
+	--seastore-secondary-des: comma-separated list of secondary blockdevs to use for seastore
+\n
 EOF
 
 usage_exit() {
@@ -350,6 +356,9 @@ case $1 in
         ;;
     --no-parallel)
         parallel=false
+        ;;
+    --no-restart)
+        restart=0
         ;;
     --valgrind)
         [ -z "$2" ] && usage_exit
@@ -502,6 +511,12 @@ case $1 in
         spdk_enabled=1
         shift
         ;;
+    --bluestore-pmem)
+        [ -z "$2" ] && usage_exit
+        bluestore_pmem_file="$2"
+        pmem_enabled=1
+        shift
+        ;;
     --bluestore-devs)
         parse_block_devs --bluestore-devs "$2"
         shift
@@ -574,10 +589,15 @@ run() {
     else
         if [ "$nodaemon" -eq 0 ]; then
             prun "$@"
-        elif [ "$redirect" -eq 0 ]; then
-            prunb ${CEPH_ROOT}/src/ceph-run "$@" -f
         else
-            ( prunb ${CEPH_ROOT}/src/ceph-run "$@" -f ) >$CEPH_OUT_DIR/$type.$num.stdout 2>&1
+            if [ "$restart" -eq 0 ]; then
+                set -- '--no-restart' "$@"
+            fi
+            if [ "$redirect" -eq 0 ]; then
+                prunb ${CEPH_ROOT}/src/ceph-run "$@" -f
+            else
+                ( prunb ${CEPH_ROOT}/src/ceph-run "$@" -f ) >$CEPH_OUT_DIR/$type.$num.stdout 2>&1
+            fi
         fi
     fi
 }
@@ -682,6 +702,7 @@ prepare_conf() {
         debug asok assert abort = true
         $(format_conf "${msgr_conf}")
         $(format_conf "${extra_conf}")
+        $AUTOSCALER_OPTS
 EOF
     if [ "$lockdep" -eq 1 ] ; then
         wconf <<EOF
@@ -714,7 +735,7 @@ EOF
         osd max object namespace len = 64"
     fi
     if [ "$objectstore" == "bluestore" ]; then
-        if [ "$spdk_enabled" -eq 1 ]; then
+        if [ "$spdk_enabled" -eq 1 ] || [ "$pmem_enabled" -eq 1 ]; then
             BLUESTORE_OPTS="        bluestore_block_db_path = \"\"
         bluestore_block_db_size = 0
         bluestore_block_db_create = false
@@ -944,7 +965,7 @@ start_osd() {
 	    if [ "$debug" -ne 0 ]; then
 		extra_seastar_args+=" --debug"
 	    fi
-            if [ "$trace" -ne 0]; then
+            if [ "$trace" -ne 0 ]; then
                 extra_seastar_args+=" --trace"
             fi
 	fi
@@ -957,8 +978,11 @@ EOF
                 wconf <<EOF
         bluestore_block_path = spdk:${bluestore_spdk_dev[$osd]}
 EOF
+            elif [ "$pmem_enabled" -eq 1 ]; then
+                wconf <<EOF
+        bluestore_block_path = ${bluestore_pmem_file}
+EOF
             fi
-
             rm -rf $CEPH_DEV_DIR/osd$osd || true
             if command -v btrfs > /dev/null; then
                 for f in $CEPH_DEV_DIR/osd$osd/*; do btrfs sub delete $f &> /dev/null || true; done
@@ -990,7 +1014,8 @@ EOF
             echo "{\"cephx_secret\": \"$OSD_SECRET\"}" > $CEPH_DEV_DIR/osd$osd/new.json
             ceph_adm osd new $uuid -i $CEPH_DEV_DIR/osd$osd/new.json
             rm $CEPH_DEV_DIR/osd$osd/new.json
-            prun $SUDO $CEPH_BIN/$ceph_osd $extra_osd_args -i $osd $ARGS --mkfs --key $OSD_SECRET --osd-uuid $uuid $extra_seastar_args
+            prun $SUDO $CEPH_BIN/$ceph_osd $extra_osd_args -i $osd $ARGS --mkfs --key $OSD_SECRET --osd-uuid $uuid $extra_seastar_args \
+                2>&1 | tee $CEPH_OUT_DIR/osd-mkfs.$osd.log
 
             local key_fn=$CEPH_DEV_DIR/osd$osd/keyring
             cat > $key_fn<<EOF
@@ -1224,7 +1249,7 @@ start_ganesha() {
     ceph_adm orch set backend test_orchestrator
     ceph_adm test_orchestrator load_data -i $CEPH_ROOT/src/pybind/mgr/test_orchestrator/dummy_data.json
     prun ceph_adm nfs cluster create $cluster_id
-    prun ceph_adm nfs export create cephfs "a" $cluster_id "/cephfs"
+    prun ceph_adm nfs export create cephfs --fsname "a" --cluster-id $cluster_id --pseudo-path "/cephfs"
 
     for name in a b c d e f g h i j k l m n o p
     do
@@ -1286,10 +1311,6 @@ EOF
 
         echo "$test_user ganesha daemon $name started on port: $port"
     done
-
-    if $with_mgr_dashboard; then
-        ceph_adm dashboard set-ganesha-clusters-rados-pool-namespace "$cluster_id:$pool_name/$cluster_id"
-    fi
 }
 
 if [ "$debug" -eq 0 ]; then
@@ -1304,6 +1325,12 @@ else
         debug auth = 20
         debug mgrc = 20
         debug ms = 1'
+fi
+
+# Crimson doesn't support PG merge/split yet.
+if [ "$ceph_osd" == "crimson-osd" ]; then
+    AUTOSCALER_OPTS='
+        osd_pool_default_pg_autoscale_mode = off'
 fi
 
 if [ -n "$MON_ADDR" ]; then
@@ -1668,13 +1695,13 @@ if [ $GANESHA_DAEMON_NUM -gt 0 ]; then
 	port="2049"
         prun ceph_adm nfs cluster create $cluster_id
 	if [ $CEPH_NUM_MDS -gt 0 ]; then
-            prun ceph_adm nfs export create cephfs "a" $cluster_id $pseudo_path
+            prun ceph_adm nfs export create cephfs --fsname "a" --cluster-id $cluster_id --pseudo-path $pseudo_path
 	    echo "Mount using: mount -t nfs -o port=$port $IP:$pseudo_path mountpoint"
 	fi
 	if [ "$CEPH_NUM_RGW" -gt 0 ]; then
             pseudo_path="/rgw"
             do_rgw_create_bucket
-	    prun ceph_adm nfs export create rgw "nfs-bucket" $cluster_id $pseudo_path
+	    prun ceph_adm nfs export create rgw --cluster-id $cluster_id --pseudo-path $pseudo_path --bucket "nfs-bucket"
             echo "Mount using: mount -t nfs -o port=$port $IP:$pseudo_path mountpoint"
 	fi
     else
